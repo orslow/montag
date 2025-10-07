@@ -216,17 +216,36 @@ class WebViewController: NSViewController {
     
     func loadWebPage(at index: Int) {
         guard index >= 0 && index < configurationManager.webpages.count else { return }
-        
+
         let webpage = configurationManager.webpages[index]
         if let url = URL(string: webpage.url) {
             let request = URLRequest(url: url)
             webView.load(request)
         }
-        
+
         // Update the radio button states
         for (buttonIndex, button) in radioButtons.enumerated() {
             button.state = buttonIndex == index ? .on : .off
         }
+    }
+
+    func focusFirstTextbox() {
+        webView.evaluateJavaScript("""
+            (function() {
+                // Find the first input field that can accept text
+                var inputs = document.querySelectorAll('input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="tel"], input[type="number"], input:not([type]), textarea');
+
+                // Focus the first visible and enabled input
+                for (var i = 0; i < inputs.length; i++) {
+                    var input = inputs[i];
+                    if (input.offsetParent !== null && !input.disabled && !input.readOnly) {
+                        input.focus();
+                        return true;
+                    }
+                }
+                return false;
+            })();
+        """, completionHandler: nil)
     }
     
     private func setupShortcuts() {
@@ -751,12 +770,15 @@ class WebViewController: NSViewController {
 extension WebViewController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         // Handle page load completion if needed
-        
+
         // Get the title of the page if available
         if let title = webView.title, !title.isEmpty {
             // Update window title if needed
             view.window?.title = title
         }
+
+        // Focus the first text input field on the page
+        focusFirstTextbox()
     }
     
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

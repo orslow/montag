@@ -173,6 +173,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
                 popover.contentViewController?.view.window?.makeKey()
+
+                // Focus the first textbox after popover is shown
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.webViewController.focusFirstTextbox()
+                }
             }
         }
     }
