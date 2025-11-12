@@ -2,12 +2,14 @@ import Cocoa
 import SwiftUI
 import WebKit
 import ApplicationServices
+import Carbon
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBarItem: NSStatusItem!
     var popover: NSPopover!
     var webViewController: WebViewController!
     var shortcutMonitor: [Any]?
+    var globalHotKeyRef: EventHotKeyRef?
     var configurationManager = ConfigurationManager()
     
     // Create a menu to handle Cmd+Q and other standard menu items
@@ -183,19 +185,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func registerGlobalShortcut() {
-        // Remove any existing shortcut monitors
-        if let existingMonitors = shortcutMonitor {
-            for monitor in existingMonitors {
-                NSEvent.removeMonitor(monitor)
-            }
-            shortcutMonitor = nil
-        }
+        // Remove any existing shortcut monitors and hotkeys
+        unregisterGlobalShortcut()
         
         guard let shortcutKey = configurationManager.globalShortcut else { return }
         
         print("Registering shortcut: Key code \(shortcutKey.keyCode), modifiers \(shortcutKey.modifiers)")
         
-        // Local monitor (works without accessibility permissions)
+        // Convert NSEvent modifier flags to Carbon modifier flags
+        var carbonModifiers: UInt32 = 0
+        let nsModifiers = shortcutKey.modifierFlags
+        
+        if nsModifiers.contains(.command) {
+            carbonModifiers |= UInt32(cmdKey)
+        }
+        if nsModifiers.contains(.option) {
+            carbonModifiers |= UInt32(optionKey)
+        }
+        if nsModifiers.contains(.control) {
+            carbonModifiers |= UInt32(controlKey)
+        }
+        if nsModifiers.contains(.shift) {
+            carbonModifiers |= UInt32(shiftKey)
+        }
+        
+        // Register Carbon global hotkey (this properly intercepts the shortcut system-wide)
+        var hotKeyID = EventHotKeyID()
+        hotKeyID.signature = OSType("MTAG".utf8.reduce(0) { ($0 << 8) + UInt32($1) })
+        hotKeyID.id = 1
+        
+        let status = RegisterEventHotKey(
+            UInt32(shortcutKey.keyCode),
+            carbonModifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &globalHotKeyRef
+        )
+        
+        if status == noErr {
+            print("Global hotkey registered successfully")
+            // Install event handler for the hotkey
+            installCarbonEventHandler()
+        } else {
+            print("Failed to register global hotkey: \(status)")
+        }
+        
+        // Fallback: Local monitor for when the app is active
         let localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.modifierFlags.contains(shortcutKey.modifierFlags) && 
                event.keyCode == shortcutKey.keyCode {
@@ -203,12 +239,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self?.togglePopover()
                 }
-                return nil // Consume the event
+                return nil // Consume the event completely - prevents passthrough to other apps
             }
             return event // Pass the event along
         }
         
-        // Global monitor (requires accessibility permissions)
+        // Global monitor for when the app is not active (requires accessibility permissions)
         let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.modifierFlags.contains(shortcutKey.modifierFlags) && 
                event.keyCode == shortcutKey.keyCode {
@@ -216,32 +252,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self?.togglePopover()
                 }
+                // Note: Global monitors cannot return nil to consume events,
+                // but Carbon hotkey should handle this case
             }
         }
         
         // Store both monitors
-        shortcutMonitor = [localMonitor as Any, globalMonitor as Any]
-        
-        // Check if accessibility permissions are granted and show instructions if not
-        checkAccessibilityPermissions()
+        var monitors: [Any] = [localMonitor as Any]
+        if let global = globalMonitor {
+            monitors.append(global as Any)
+        }
+        shortcutMonitor = monitors
     }
     
-    private func checkAccessibilityPermissions() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        let accessEnabled = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        
-        if !accessEnabled {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permissions Required"
-            alert.informativeText = "To use global shortcuts, montag needs accessibility permissions. Please go to System Preferences > Security & Privacy > Privacy > Accessibility and add montag to the list of allowed apps."
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
-            
-            DispatchQueue.main.async {
-                alert.runModal()
+    private func unregisterGlobalShortcut() {
+        // Remove existing monitors
+        if let existingMonitors = shortcutMonitor {
+            for monitor in existingMonitors {
+                NSEvent.removeMonitor(monitor)
             }
+            shortcutMonitor = nil
+        }
+        
+        // Unregister Carbon hotkey
+        if let hotKeyRef = globalHotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            globalHotKeyRef = nil
         }
     }
+    
+    private func installCarbonEventHandler() {
+        var eventHandler: EventHandlerRef?
+        let eventTypes = [EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))]
+        
+        let handler: EventHandlerUPP = { (nextHandler, theEvent, userData) -> OSStatus in
+            guard let appDelegate = userData?.assumingMemoryBound(to: AppDelegate.self).pointee else {
+                return OSStatus(eventNotHandledErr)
+            }
+            
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(
+                theEvent,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+            
+            if status == noErr && hotKeyID.signature == OSType("MTAG".utf8.reduce(0) { ($0 << 8) + UInt32($1) }) {
+                print("Carbon hotkey triggered")
+                DispatchQueue.main.async {
+                    appDelegate.togglePopover()
+                }
+                return noErr // Event handled - prevents passthrough to other apps
+            }
+            
+            return OSStatus(eventNotHandledErr)
+        }
+        
+        let selfPtr = UnsafeMutablePointer<AppDelegate>.allocate(capacity: 1)
+        selfPtr.initialize(to: self)
+        
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            handler,
+            1,
+            eventTypes,
+            selfPtr,
+            &eventHandler
+        )
+    }
+    
     
     func registerForStartup() {
         let launchAtLoginHelper = LaunchAtLoginHelper()
@@ -250,11 +333,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationWillTerminate(_ notification: Notification) {
         // Clean up resources
-        if let monitors = shortcutMonitor {
-            for monitor in monitors {
-                NSEvent.removeMonitor(monitor)
-            }
-        }
+        unregisterGlobalShortcut()
         
         // Save configuration before exit
         configurationManager.saveConfiguration()
